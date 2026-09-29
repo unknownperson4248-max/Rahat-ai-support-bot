@@ -1,9 +1,15 @@
 import os
+import re
+import html
 import requests
 from collections import defaultdict, deque
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+
+# =========================================================
+# ENVIRONMENT
+# =========================================================
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
@@ -14,13 +20,28 @@ GEMINI_MODEL = os.environ.get(
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# Recent temporary conversation memory
-chat_memory = defaultdict(lambda: deque(maxlen=12))
+WHATSAPP_SUPPORT = "01326137501"
+
+WEBSITE = "https://wizefftopup.com/"
+TELEGRAM_CHANNEL = "https://t.me/wizefftopup"
+
+
+# =========================================================
+# TEMPORARY CONVERSATION MEMORY
+# =========================================================
+
+# Last 16 user/model messages per customer.
+# Render restart/sleep can clear this memory.
+chat_memory = defaultdict(
+    lambda: deque(maxlen=16)
+)
+
+
+# =========================================================
+# VERIFIED PRODUCT LINKS
+# =========================================================
 
 PRODUCT_LINKS = {
-    "website":
-        "https://wizefftopup.com/",
-
     "free_fire_bd":
         "https://wizefftopup.com/product/free-fire-topup-bd",
 
@@ -29,139 +50,422 @@ PRODUCT_LINKS = {
 }
 
 
+# =========================================================
+# CUSTOM TELEGRAM EMOJIS
+# =========================================================
+
+CUSTOM_EMOJIS = {
+    # Natural conversation
+    "HELLO": "5208944462666937898",
+    "HAPPY": "5240111691714301066",
+    "THANKS": "5213309687037964344",
+    "FUNNY": "5276337181055533947",
+    "THINKING": "5314627136621922948",
+    "OKAY": "5458485283790004353",
+    "SORRY": "6093376514944929700",
+    "EXCITED": "5362034620562940839",
+    "HELP": "5372882114519772804",
+    "TRUSTED": "6206053951163340256",
+
+    # Special
+    "POSITIVE": "5215538285438311443",
+    "PRICE": "6267068789146260253",
+    "LINK": "6267115986541877538",
+    "WARNING": "6267039884016358504",
+    "SPAM": "6267262260243076354",
+    "UPDATE": "6267119710278522544",
+    "LOOKING": "6267186570034419608",
+    "COMING": "6266866272848321043",
+    "IMPORTANT": "6267172559851099903",
+    "LOVE": "6267140231632262769",
+    "GUILD": "5404881132703489171",
+
+    # Payment emojis
+    "PAY1": "6204045134829458891",
+    "PAY2": "6206444247726430845",
+    "PAY3": "6206238411418768661",
+    "PAY4": "6224054386734143462",
+    "PAY5": "6224521357053401458",
+    "PAY6": "6066835949222894322",
+    "PAY7": "6224382307487193805",
+}
+
+
+# Fallback emoji displayed if custom emoji cannot animate/render.
+EMOJI_FALLBACK = {
+    "HELLO": "👋",
+    "HAPPY": "😊",
+    "THANKS": "🙏",
+    "FUNNY": "😂",
+    "THINKING": "🤔",
+    "OKAY": "👌",
+    "SORRY": "😔",
+    "EXCITED": "✨",
+    "HELP": "🛟",
+    "TRUSTED": "🛡️",
+
+    "POSITIVE": "✨",
+    "PRICE": "💰",
+    "LINK": "🔗",
+    "WARNING": "⚠️",
+    "SPAM": "🚫",
+    "UPDATE": "📢",
+    "LOOKING": "🔎",
+    "COMING": "⏳",
+    "IMPORTANT": "📌",
+    "LOVE": "💙",
+    "GUILD": "🎮",
+
+    "PAY1": "💳",
+    "PAY2": "💵",
+    "PAY3": "💰",
+    "PAY4": "💳",
+    "PAY5": "💸",
+    "PAY6": "🏦",
+    "PAY7": "✅",
+}
+
+
+# =========================================================
+# SYSTEM PROMPT
+# =========================================================
+
 SYSTEM_PROMPT = """
 You are WizeFFTopUp's AI customer support assistant.
 
-LANGUAGE:
-- ALWAYS reply in the same language the customer uses.
-- Bengali -> Bengali.
-- Banglish -> natural Banglish/Bengali.
-- English -> English.
-- Hindi -> Hindi.
-- For another language, reply in that language when possible.
+==================================================
+LANGUAGE
+==================================================
 
-STYLE:
-- Talk naturally, warmly and professionally.
-- You can have normal casual conversations.
-- Do not sound robotic or repetitive.
-- Do not greet again in every message.
-- Keep replies reasonably short.
-- Never pretend to be a real human.
-- If asked, say you are WizeFFTopUp's AI support assistant.
+Always reply in the same language/style the customer uses.
 
-SUPPORT:
+Examples:
+- Bengali -> Bengali
+- Banglish -> natural Banglish/Bengali
+- English -> English
+- Hindi -> Hindi
+- Other language -> same language when possible
+
+If the customer changes language, naturally follow them.
+
+==================================================
+PERSONALITY
+==================================================
+
+Talk naturally, warmly and professionally.
+
+You can have normal casual conversations.
+
+Do not sound robotic.
+Do not repeat the same greeting.
+Do not start every reply with "Hello".
+Do not give unnecessarily long answers.
+
+Normal conversation should also look clean and pleasant.
+
+Never pretend to be a real human.
+
+If directly asked whether you are human, explain naturally that
+you are WizeFFTopUp's AI support assistant.
+
+==================================================
+CUSTOM EMOJI MARKERS
+==================================================
+
+You may use ONLY these markers:
+
+[[HELLO]]
+[[HAPPY]]
+[[THANKS]]
+[[FUNNY]]
+[[THINKING]]
+[[OKAY]]
+[[SORRY]]
+[[EXCITED]]
+[[HELP]]
+[[TRUSTED]]
+
+[[POSITIVE]]
+[[PRICE]]
+[[LINK]]
+[[WARNING]]
+[[SPAM]]
+[[UPDATE]]
+[[LOOKING]]
+[[COMING]]
+[[IMPORTANT]]
+[[LOVE]]
+[[GUILD]]
+
+[[PAYMENT_ROW]]
+
+The server converts these markers into Telegram custom emojis.
+
+IMPORTANT:
+- Do not print custom emoji numeric IDs.
+- Do not invent new markers.
+- Do not use an emoji in every reply.
+- Usually use 0-2 markers per message.
+- Keep emojis natural and non-spammy.
+- Use [[POSITIVE]] naturally after something successful/positive.
+- Use [[LOVE]] for friendly/caring positive conversation.
+- Use [[PRICE]] for price-related replies.
+- Use [[LINK]] immediately before an actual requested link.
+- Use [[WARNING]] only for a genuine warning.
+- Use [[SPAM]] only when excessive spam is actually relevant.
+- Use [[LOOKING]] when helping locate/find something.
+- Use [[COMING]] for verified coming-soon context only.
+- Use [[IMPORTANT]] for genuinely important information.
+- Use [[HELP]] when support/help is relevant.
+- Use [[THANKS]] when naturally responding to thanks.
+- Use [[HELLO]] for a natural greeting when appropriate.
+- Use [[TRUSTED]] when a customer specifically asks whether
+  WizeFFTopUp/website is trusted or asks for trust/reliability.
+- Never use [[TRUSTED]] to make an unverified 100% guarantee.
+
+PAYMENT:
+- If a payment-system emoji line is genuinely useful,
+  use [[PAYMENT_ROW]].
+- [[PAYMENT_ROW]] becomes all configured payment custom emojis
+  on ONE LINE.
+- Do not repeatedly spam the payment row.
+
+==================================================
+SUPPORT
+==================================================
+
 Help with:
-- WizeFFTopUp services.
-- Game top-ups.
-- Free Fire top-up support.
-- PUBG top-up support.
-- Digital products/subscriptions.
-- Order questions.
-- Payment questions.
-- Pending top-ups.
-- Top-up not received.
-- Balance/payment issues.
-- General questions.
-- Normal friendly conversation.
+- WizeFFTopUp services
+- Game top-ups
+- Free Fire
+- PUBG
+- Digital products/subscriptions
+- Orders
+- Payments
+- Pending top-ups
+- Top-up not received
+- Balance/payment issues
+- General questions
+- Normal conversation
 
-PRICE:
-- NEVER invent or guess a price.
-- Prices may change.
-- If asked for a price, provide the verified WizeFFTopUp
-  product link supplied with the customer's message.
-- Tell the customer to check that page for the current price.
-- If no direct product link is available, provide:
-  https://wizefftopup.com/
-- Never invent a product URL.
-- If they still cannot find the product, offer Human Support.
+==================================================
+PRICE AND LINKS
+==================================================
 
-ORDER / TOP-UP PROBLEMS:
-If a top-up is pending, failed, delayed or not received:
-- Understand the problem using recent conversation context.
-- Ask for Order ID/reference when appropriate.
-- Ask them to verify their UID/player ID when relevant.
-- Processing delays can sometimes happen.
-- NEVER invent the cause.
-- NEVER say you checked an order unless verified order
-  information is actually available.
-- NEVER invent order status.
-- NEVER promise an exact completion time.
-- Escalate unresolved cases to Human Support.
+NEVER invent or guess prices.
 
-PAYMENT / BALANCE:
-If money was deducted but balance/order was not added:
-- Ask whether payment shows as completed.
-- Ask for a non-sensitive transaction reference or Order ID
-  when useful.
-- Never claim payment was received unless verified.
-- Never invent payment/refund status or technical causes.
+IMPORTANT LINK RULE:
 
-NEVER request:
-- Passwords.
-- OTP codes.
-- PINs.
-- CVV.
-- Full card details.
-- API keys.
-- Recovery codes.
-- Secret credentials.
+Do NOT automatically give a website/product link in normal replies.
 
-UC / USDT:
-- Answer general questions only using verified information.
-- Never invent UC buy/sell rates.
-- Never invent minimum USDT amounts.
-- Never invent payment methods.
-- Never invent limits or exchange rates.
-- If exact information is unavailable, use Human Support.
+Only provide a link when the customer:
+- asks for a price/current price,
+- explicitly asks for a link,
+- asks where to find/buy/view a product,
+- asks for the website/page,
+- or clearly needs a page to complete their request.
 
-NORMAL CONVERSATION:
-- Customers can talk normally.
-- Reply naturally in their language.
-- Use recent conversation context.
-- Understand follow-up messages.
-- If they say "thanks", reply naturally instead of restarting
-  customer support.
+When a verified link is supplied in INTERNAL INFORMATION,
+you may use that exact link.
 
-HUMAN SUPPORT:
+Never invent URLs.
+
+For price questions:
+- Do not invent the price.
+- Explain that current prices can change.
+- Give the verified product/page link when available.
+- Put [[PRICE]] naturally in the reply.
+- Put [[LINK]] immediately before the URL.
+
+If only the main website is available, use it only when the
+customer actually requested a link/price/page.
+
+==================================================
+WEBSITE UPDATES
+==================================================
+
+If the customer asks about:
+- website updates,
+- new updates,
+- announcements,
+- website news,
+- official Telegram group/channel,
+
+give the verified official Telegram link supplied internally.
+
+Use [[UPDATE]] or [[IMPORTANT]] naturally.
+
+Do not give the Telegram channel in unrelated conversations.
+
+==================================================
+TRUST QUESTIONS
+==================================================
+
+If the customer asks:
+- "website trusted?"
+- "WizeFFTopUp trusted?"
+- "is it safe?"
+- similar trust/reliability questions,
+
+use [[TRUSTED]] naturally.
+
+Do NOT invent guarantees, fake reviews, fake statistics,
+fake certifications or claims you cannot verify.
+
+You can point them to the official website/support channels
+and explain that they should use official WizeFFTopUp contacts.
+
+==================================================
+TOP-UP / ORDER PROBLEMS
+==================================================
+
+If top-up is:
+- pending,
+- failed,
+- delayed,
+- not received,
+- missing,
+
+understand the problem from conversation context.
+
+Ask for Order ID/reference when appropriate.
+
+Ask the customer to verify the correct UID/player ID when relevant.
+
+Processing delays can sometimes happen, but NEVER invent the cause.
+
+NEVER claim:
+- you checked an order when you did not,
+- an order is completed when unverified,
+- an order is pending when unverified,
+- an order was cancelled when unverified,
+- a refund happened when unverified.
+
+Never promise an exact completion time unless verified.
+
+If manual checking is needed, escalate to Human Support.
+
+==================================================
+PAYMENT / BALANCE
+==================================================
+
+If the customer says:
+- money was deducted,
+- payment completed but balance was not added,
+- payment succeeded but order did not arrive,
+- balance is missing,
+
+ask whether payment shows completed.
+
+Ask for a non-sensitive Order ID or transaction reference
+when useful.
+
+Never invent payment status.
+Never invent refund status.
+Never invent technical causes.
+
+Never request:
+- passwords
+- OTP
+- PIN
+- CVV
+- full card details
+- API keys
+- recovery codes
+- secret credentials
+
+If manual verification is needed, escalate to Human Support.
+
+==================================================
+UC / USDT
+==================================================
+
+Answer general questions only using verified information.
+
+Never invent:
+- UC buy/sell rates
+- USDT minimum
+- payment methods
+- transaction limits
+- exchange rates
+
+If exact information is unavailable, use Human Support.
+
+==================================================
+NORMAL CONVERSATION
+==================================================
+
+Customers may chat normally.
+
+Respond naturally and remember recent conversation context.
+
+Examples:
+- greetings
+- thanks
+- jokes
+- casual questions
+- follow-up questions
+
+Do not turn every normal conversation into a sales message.
+
+Do not add website links unless requested/relevant under the
+LINK RULE.
+
+Use custom emoji markers naturally and sparingly.
+
+==================================================
+HUMAN SUPPORT
+==================================================
+
 Official WizeFFTopUp WhatsApp Support:
 01326137501
 
 Human Support is needed when:
-- Customer asks for a human/admin/agent.
-- Manual payment verification is needed.
-- An order/top-up problem cannot be resolved.
-- Information needed is unavailable.
-- Business-specific information would otherwise have to be guessed.
-- Customer cannot find a product.
+- customer asks for human/admin/agent,
+- payment needs manual verification,
+- top-up/order issue cannot be resolved,
+- required business-specific information is unavailable,
+- answering would require guessing,
+- customer needs manual account/order checking.
 
-When Human Support is needed:
-- Tell the customer in THEIR language that their issue has
-  been forwarded to Human Support.
-- Give WhatsApp Support: 01326137501.
-- Tell them they can message that number on WhatsApp.
-- Add this marker at the VERY END:
+When escalation is required:
+
+1. Reply in the customer's language.
+2. Explain that the issue needs/has been forwarded to Human Support.
+3. Give WhatsApp Support: 01326137501
+4. Do not ask for passwords/OTP/secrets.
+5. Add this exact marker at the VERY END:
 
 [HUMAN_SUPPORT]
 
-The marker is internal. Do not explain it.
+Do not explain this marker.
 
-ACCURACY:
+==================================================
+ACCURACY
+==================================================
+
 Never invent:
-- Prices.
-- Order status.
-- Payment status.
-- Refund status.
-- Product availability.
-- Business policies.
-- Payment methods.
-- UC rates.
-- USDT minimums.
-- Completion times.
-- Technical causes.
+- prices
+- product availability
+- order status
+- payment status
+- refund status
+- business policies
+- payment methods
+- UC rates
+- USDT minimums
+- completion times
+- technical causes
+- trust statistics
+- reviews
 
-If uncertain, say so and use Human Support.
+When uncertain, be transparent and use Human Support if needed.
 """
 
+
+# =========================================================
+# TELEGRAM API
+# =========================================================
 
 def tg(method, payload=None):
     response = requests.post(
@@ -179,15 +483,11 @@ def tg(method, payload=None):
     return data.get("result")
 
 
-def get_business_info(connection_id):
-    """
-    Gets:
-    - ID of the Telegram Business account owner
-    - user_chat_id: private chat where the bot can contact
-      the Business account owner
-    - whether bot can reply
-    """
+# =========================================================
+# BUSINESS CONNECTION INFO
+# =========================================================
 
+def get_business_info(connection_id):
     result = tg(
         "getBusinessConnection",
         {
@@ -210,67 +510,206 @@ def get_business_info(connection_id):
     return owner_id, owner_chat_id, can_reply
 
 
-def get_product_link(message):
-    text = message.lower()
+# =========================================================
+# DETECT WHEN CUSTOMER ACTUALLY WANTS A LINK
+# =========================================================
+
+def wants_link(text):
+    t = text.lower()
+
+    keywords = [
+        "link",
+        "লিংক",
+        "লিঙ্ক",
+        "website",
+        "ওয়েবসাইট",
+        "ওয়েবসাইট",
+        "site",
+        "page",
+        "পেজ",
+        "price",
+        "দাম",
+        "কত টাকা",
+        "koto",
+        "koto taka",
+        "price koto",
+        "where can i buy",
+        "where to buy",
+        "where can i find",
+        "where to find",
+        "কোথায় পাব",
+        "কোথায় পাব",
+        "কোথা থেকে কিনব",
+        "khujte",
+        "kothay pabo",
+        "koi pabo",
+    ]
+
+    return any(
+        keyword in t
+        for keyword in keywords
+    )
+
+
+# =========================================================
+# WEBSITE UPDATE DETECTION
+# =========================================================
+
+def wants_update_channel(text):
+    t = text.lower()
+
+    keywords = [
+        "website update",
+        "site update",
+        "new update",
+        "updates",
+        "announcement",
+        "announcements",
+        "telegram group",
+        "telegram channel",
+        "official telegram",
+        "আপডেট",
+        "টেলিগ্রাম গ্রুপ",
+        "টেলিগ্রাম চ্যানেল",
+        "update group",
+    ]
+
+    return any(
+        keyword in t
+        for keyword in keywords
+    )
+
+
+# =========================================================
+# VERIFIED LINK SELECTION
+# =========================================================
+
+def get_verified_link(text):
+    t = text.lower()
 
     if (
-        "weekly" in text
-        or "monthly" in text
-        or "সাপ্তাহিক" in text
-        or "মাসিক" in text
+        "weekly" in t
+        or "monthly" in t
+        or "সাপ্তাহিক" in t
+        or "মাসিক" in t
     ):
-        return PRODUCT_LINKS["weekly_monthly"]
+        return PRODUCT_LINKS[
+            "weekly_monthly"
+        ]
 
     if (
-        "free fire" in text
-        or "freefire" in text
-        or "ff diamond" in text
-        or "ff topup" in text
-        or "ff top up" in text
-        or "ফ্রি ফায়ার" in text
-        or "ফ্রি ফায়ার" in text
+        "free fire" in t
+        or "freefire" in t
+        or "ff diamond" in t
+        or "ff topup" in t
+        or "ff top up" in t
+        or "ফ্রি ফায়ার" in t
+        or "ফ্রি ফায়ার" in t
     ):
-        return PRODUCT_LINKS["free_fire_bd"]
+        return PRODUCT_LINKS[
+            "free_fire_bd"
+        ]
 
-    return PRODUCT_LINKS["website"]
+    # Unknown product:
+    # never invent a direct URL.
+    return WEBSITE
 
 
-def build_gemini_contents(chat_id, new_message):
+# =========================================================
+# INTERNAL INFORMATION
+# =========================================================
+
+def build_internal_info(message):
+    info = []
+
+    if wants_link(message):
+        verified_link = get_verified_link(
+            message
+        )
+
+        info.append(
+            "Customer appears to be requesting a price/link/page."
+        )
+
+        info.append(
+            "VERIFIED LINK YOU MAY PROVIDE: "
+            + verified_link
+        )
+
+        info.append(
+            "Do not invent any other URL."
+        )
+
+    else:
+        info.append(
+            "Customer did NOT clearly request a link. "
+            "Do NOT include website/product URLs unless "
+            "the reply genuinely requires one under the link rules."
+        )
+
+    if wants_update_channel(message):
+        info.append(
+            "VERIFIED OFFICIAL WIZEFFTOPUP TELEGRAM LINK: "
+            + TELEGRAM_CHANNEL
+        )
+
+    return "\n".join(info)
+
+
+# =========================================================
+# BUILD GEMINI CONVERSATION
+# =========================================================
+
+def build_gemini_contents(
+    chat_id,
+    new_message
+):
     contents = []
 
-    for item in list(chat_memory[chat_id]):
+    for item in list(
+        chat_memory[chat_id]
+    ):
         contents.append({
             "role": item["role"],
             "parts": [
-                {"text": item["text"]}
+                {
+                    "text": item["text"]
+                }
             ]
         })
 
-    verified_link = get_product_link(
+    internal_info = build_internal_info(
         new_message
     )
 
     enriched_message = (
         new_message
         + "\n\n"
-        + "INTERNAL VERIFIED INFORMATION:\n"
-        + "Relevant verified WizeFFTopUp link: "
-        + verified_link
-        + "\nUse this link when relevant. "
-          "Never invent another product URL."
+        + "=== INTERNAL SERVER INFORMATION ===\n"
+        + internal_info
+        + "\n=== END INTERNAL INFORMATION ==="
     )
 
     contents.append({
         "role": "user",
         "parts": [
-            {"text": enriched_message}
+            {
+                "text": enriched_message
+            }
         ]
     })
 
     return contents
 
 
-def ask_gemini(chat_id, message):
+# =========================================================
+# GEMINI
+# =========================================================
+
+def ask_gemini(
+    chat_id,
+    message
+):
     url = (
         "https://generativelanguage.googleapis.com/"
         "v1beta/models/"
@@ -278,25 +717,32 @@ def ask_gemini(chat_id, message):
     )
 
     headers = {
-        "x-goog-api-key": GEMINI_KEY,
-        "Content-Type": "application/json"
+        "x-goog-api-key":
+            GEMINI_KEY,
+
+        "Content-Type":
+            "application/json"
     }
 
     payload = {
         "system_instruction": {
             "parts": [
-                {"text": SYSTEM_PROMPT}
+                {
+                    "text":
+                        SYSTEM_PROMPT
+                }
             ]
         },
 
-        "contents": build_gemini_contents(
-            chat_id,
-            message
-        ),
+        "contents":
+            build_gemini_contents(
+                chat_id,
+                message
+            ),
 
         "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": 700
+            "temperature": 0.75,
+            "maxOutputTokens": 800
         }
     }
 
@@ -339,268 +785,93 @@ def ask_gemini(chat_id, message):
     return answer
 
 
+# =========================================================
+# CUSTOM EMOJI CONVERSION
+# =========================================================
+
+def custom_emoji_html(name):
+    emoji_id = CUSTOM_EMOJIS.get(name)
+
+    fallback = EMOJI_FALLBACK.get(
+        name,
+        "✨"
+    )
+
+    if not emoji_id:
+        return fallback
+
+    return (
+        f'<tg-emoji emoji-id="{emoji_id}">'
+        f'{fallback}'
+        f'</tg-emoji>'
+    )
+
+
+def payment_row_html():
+    payment_names = [
+        "PAY1",
+        "PAY2",
+        "PAY3",
+        "PAY4",
+        "PAY5",
+        "PAY6",
+        "PAY7",
+    ]
+
+    return " ".join(
+        custom_emoji_html(name)
+        for name in payment_names
+    )
+
+
+def format_for_telegram(text):
+    """
+    Escapes Gemini text first, then replaces only our
+    approved markers with Telegram custom emoji HTML.
+    """
+
+    safe_text = html.escape(
+        text,
+        quote=False
+    )
+
+    safe_text = safe_text.replace(
+        "[[PAYMENT_ROW]]",
+        payment_row_html()
+    )
+
+    for name in CUSTOM_EMOJIS:
+        # Payment emojis are handled only
+        # through PAYMENT_ROW.
+        if name.startswith("PAY"):
+            continue
+
+        marker = f"[[{name}]]"
+
+        safe_text = safe_text.replace(
+            marker,
+            custom_emoji_html(name)
+        )
+
+    # Remove any unknown marker Gemini might invent.
+    safe_text = re.sub(
+        r"\[\[[A-Z0-9_]+\]\]",
+        "",
+        safe_text
+    )
+
+    return safe_text.strip()
+
+
+# =========================================================
+# MEMORY
+# =========================================================
+
 def save_memory(
     chat_id,
     user_message,
     assistant_message
 ):
-    chat_memory[chat_id].append({
-        "role": "user",
-        "text": user_message
-    })
-
-    chat_memory[chat_id].append({
-        "role": "model",
-        "text": assistant_message
-    })
-
-
-def send_business_reply(
-    chat_id,
-    connection_id,
-    message_id,
-    text
-):
-    tg(
-        "sendMessage",
-        {
-            "business_connection_id":
-                connection_id,
-
-            "chat_id":
-                chat_id,
-
-            "text":
-                text[:4000],
-
-            "reply_parameters": {
-                "message_id":
-                    message_id
-            }
-        }
-    )
-
-
-def notify_owner(
-    owner_chat_id,
-    customer_name,
-    customer_username,
-    customer_id,
-    customer_message
-):
-    """
-    Sends the Human Support alert to the private chat
-    associated with the connected Business account.
-    """
-
-    if not owner_chat_id:
-        return
-
-    username_text = ""
-
-    if customer_username:
-        username_text = (
-            f"\nUsername: @{customer_username}"
-        )
-
-    notification = (
-        "🔔 HUMAN SUPPORT NEEDED\n\n"
-        f"Customer: {customer_name}"
-        f"{username_text}\n"
-        f"Telegram ID: {customer_id}\n\n"
-        "Customer message:\n"
-        f"{customer_message[:2000]}\n\n"
-        "Please open the customer conversation "
-        "and reply manually.\n\n"
-        "WizeFFTopUp WhatsApp: 01326137501"
-    )
-
-    # IMPORTANT:
-    # No business_connection_id here.
-    # This is a normal private notification from the bot
-    # to the connected Business account owner.
-    tg(
-        "sendMessage",
-        {
-            "chat_id":
-                owner_chat_id,
-
-            "text":
-                notification
-        }
-    )
-
-
-@app.route("/", methods=["GET"])
-def home():
-    return "WizeFFTopUp AI Support is running!"
-
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    update = (
-        request.get_json(
-            silent=True
-        )
-        or {}
-    )
-
-    message = update.get(
-        "business_message"
-    )
-
-    if not message:
-        return jsonify({"ok": True})
-
-    text = message.get("text")
-
-    connection_id = message.get(
-        "business_connection_id"
-    )
-
-    chat = message.get(
-        "chat",
-        {}
-    )
-
-    sender = message.get(
-        "from",
-        {}
-    )
-
-    chat_id = chat.get("id")
-    message_id = message.get("message_id")
-
-    if (
-        not text
-        or not connection_id
-        or not chat_id
-        or not message_id
-        or chat.get("type") != "private"
-    ):
-        return jsonify({"ok": True})
-
-    try:
-        (
-            owner_id,
-            owner_chat_id,
-            can_reply
-        ) = get_business_info(
-            connection_id
-        )
-
-        # Ignore your own outgoing messages.
-        if sender.get("id") == owner_id:
-            return jsonify({"ok": True})
-
-        # Ignore bot messages.
-        if sender.get("is_bot"):
-            return jsonify({"ok": True})
-
-        if not can_reply:
-            return jsonify({"ok": True})
-
-        answer = ask_gemini(
-            chat_id,
-            text
-        )
-
-        needs_human = (
-            "[HUMAN_SUPPORT]" in answer
-        )
-
-        clean_answer = (
-            answer.replace(
-                "[HUMAN_SUPPORT]",
-                ""
-            ).strip()
-        )
-
-        if clean_answer:
-            send_business_reply(
-                chat_id,
-                connection_id,
-                message_id,
-                clean_answer
-            )
-
-            save_memory(
-                chat_id,
-                text,
-                clean_answer
-            )
-
-        if needs_human:
-            first_name = sender.get(
-                "first_name",
-                ""
-            )
-
-            last_name = sender.get(
-                "last_name",
-                ""
-            )
-
-            customer_name = (
-                f"{first_name} {last_name}"
-                .strip()
-                or "Unknown"
-            )
-
-            notify_owner(
-                owner_chat_id,
-                customer_name,
-                sender.get("username"),
-                sender.get("id", "Unknown"),
-                text
-            )
-
-    except Exception as error:
-        print(
-            "ERROR:",
-            type(error).__name__,
-            str(error)[:500]
-        )
-
-    return jsonify({"ok": True})
-
-
-@app.route("/setup", methods=["GET"])
-def setup():
-    webhook_url = (
-        request.url_root.rstrip("/")
-        + "/webhook"
-    )
-
-    result = tg(
-        "setWebhook",
-        {
-            "url":
-                webhook_url,
-
-            "allowed_updates": [
-                "business_connection",
-                "business_message"
-            ]
-        }
-    )
-
-    return jsonify({
-        "ok": True,
-        "telegram_result": result,
-        "webhook": webhook_url
-    })
-
-
-if __name__ == "__main__":
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    # Store clean text without internal HUMAN marker.
+    # Emoji markers may remain in memory, which helps Gemini
+    # under

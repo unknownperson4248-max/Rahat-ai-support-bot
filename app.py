@@ -957,7 +957,18 @@ def handle_business_message(message):
     if not connection or sender.get('is_bot') or message.get('sender_business_bot'): return
     info=get_business_info(connection)
     # A connected account is not automatically authorized to manage this bot.
-    if not OWNER_TELEGRAM_ID or info['owner_id']!=OWNER_TELEGRAM_ID or not info['can_reply']: return
+    # Log only the routing reason (never message text, tokens, or connection IDs)
+    # so a wrong Render OWNER_TELEGRAM_ID cannot fail silently again.
+    if not OWNER_TELEGRAM_ID:
+        app.logger.warning('Business message ignored: OWNER_TELEGRAM_ID is not configured')
+        return
+    if info['owner_id'] != OWNER_TELEGRAM_ID:
+        app.logger.warning('Business message ignored: configured owner does not match connected business account')
+        return
+    if not info['can_reply']:
+        app.logger.warning('Business message ignored: business connection cannot reply')
+        return
+    app.logger.info('Business message accepted for customer routing')
     text=(message.get('text') or '').strip()
     if sender.get('id')==info['owner_id']:
         cmd=command(text)

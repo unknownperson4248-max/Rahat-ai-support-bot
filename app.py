@@ -745,7 +745,7 @@ def ask_groq(key,user_text,language,history,knowledge,state,catalog,allowed_urls
     try:
         response=requests.post('https://api.groq.com/openai/v1/chat/completions',
             headers={'Authorization':f'Bearer {GROQ_API_KEY}','Content-Type':'application/json'},
-            json={'model':GROQ_MODEL,'messages':messages,'temperature':0.3,'max_tokens':350,
+            json={'model':GROQ_MODEL,'messages':messages,'temperature':0.3,'max_completion_tokens':350,
                   'response_format':{'type':'json_object'}},timeout=25)
         if response.status_code!=200: raise ValueError('generation failed')
         data=json.loads(response.json()['choices'][0]['message']['content'])

@@ -26,6 +26,8 @@ app = Flask(__name__)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b").strip()
+GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct").strip()
+GROQ_WHISPER_MODEL = os.environ.get("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo").strip()
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
@@ -622,6 +624,77 @@ def telegram_post(method,payload):
         return {'ok':False}
 
 
+def telegram_file_bytes(file_id, max_bytes=8_000_000):
+    """Download a Telegram file without persisting it or logging its URL/content."""
+    meta=telegram_post('getFile',{'file_id':file_id})
+    path=(meta.get('result') or {}).get('file_path') if meta.get('ok') else ''
+    if not path: return b''
+    try:
+        r=requests.get(f'https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{path}',timeout=20)
+        if r.status_code!=200 or len(r.content)>max_bytes: return b''
+        return r.content
+    except requests.RequestException:
+        return b''
+
+
+def transcribe_voice(message):
+    media=message.get('voice') or message.get('audio') or {}
+    file_id=media.get('file_id')
+    if not file_id or not GROQ_API_KEY: return ''
+    blob=telegram_file_bytes(file_id,12_000_000)
+    if not blob: return ''
+    try:
+        r=requests.post('https://api.groq.com/openai/v1/audio/transcriptions',
+            headers={'Authorization':f'Bearer {GROQ_API_KEY}'},
+            files={'file':('voice.ogg',blob,'audio/ogg')},
+            data={'model':GROQ_WHISPER_MODEL,'response_format':'json'},timeout=35)
+        if r.status_code!=200: return ''
+        return safe_text((r.json() or {}).get('text',''))[:4000]
+    except (requests.RequestException,ValueError):
+        return ''
+
+
+def understand_image(message, language='Banglish'):
+    photos=message.get('photo') or []
+    document=message.get('document') or {}
+    file_id=(photos[-1].get('file_id') if photos else
+             document.get('file_id') if str(document.get('mime_type','')).startswith('image/') else '')
+    if not file_id or not GROQ_API_KEY: return ''
+    blob=telegram_file_bytes(file_id,8_000_000)
+    if not blob: return ''
+    import base64
+    mime=document.get('mime_type') or 'image/jpeg'
+    encoded=base64.b64encode(blob).decode('ascii')
+    prompt=('Analyze this customer support screenshot for WizeFF TopUp. Extract only visible, relevant facts: '
+            'payment/order state, error text, reference/transaction identifiers if clearly visible, and what the '
+            'customer should do next. Never claim backend verification. Never invent a cause. If the screenshot '
+            'shows an error, explain likely causes as possibilities (for example mistyped transaction/reference '
+            'information or a temporary processing issue) and suggest a safe retry/wait step. '
+            f'Reply briefly in {language}.')
+    try:
+        r=requests.post('https://api.groq.com/openai/v1/chat/completions',
+            headers={'Authorization':f'Bearer {GROQ_API_KEY}','Content-Type':'application/json'},
+            json={'model':GROQ_VISION_MODEL,'messages':[{'role':'user','content':[
+                {'type':'text','text':prompt},
+                {'type':'image_url','image_url':{'url':f'data:{mime};base64,{encoded}'}}]}],
+                'temperature':0.2,'max_completion_tokens':350},timeout=35)
+        if r.status_code!=200: return ''
+        return safe_text(r.json()['choices'][0]['message']['content'])[:4000]
+    except (requests.RequestException,ValueError,KeyError,IndexError,TypeError):
+        return ''
+
+
+def incoming_text(message,key=''):
+    text=(message.get('text') or message.get('caption') or '').strip()
+    if text: return text
+    if message.get('voice') or message.get('audio'):
+        return transcribe_voice(message)
+    if message.get('photo') or str((message.get('document') or {}).get('mime_type','')).startswith('image/'):
+        language=get_value('customer_language',key,'Banglish') if key else 'Banglish'
+        return understand_image(message,language)
+    return ''
+
+
 def send_message(chat_id,text,reply_to=None,business_connection_id=None):
     payload={'chat_id':chat_id,'text':text,'parse_mode':'HTML'}
     if reply_to: payload['reply_parameters']={'message_id':reply_to,'allow_sending_without_reply':True}
@@ -724,9 +797,12 @@ Payment emojis are decoration. If verified payment methods are absent, refer to 
 Do not promote/discover gambling, adult, privacy-invasive identity/location/call-record services.
 Do not append links routinely. Only use exactly the supplied allowed URLs when useful for this request.
 Official site: {WEBSITE}; announcements: {TELEGRAM_CHANNEL}; human WhatsApp: {WHATSAPP_SUPPORT}.
-Use plain text, no HTML/Markdown. Return a JSON object:
-{{"reply":"natural reply","needs_human":false,"awaiting_reference":false}}.
-Set awaiting_reference=true only if your reply actually asks for order/reference ID.
+Use plain text, no HTML/Markdown. Decide whether a reply is actually useful. Acknowledgements such as ok/thanks/emoji, random personal chatter,
+or messages you cannot answer reliably may be left unanswered. Never send an error/fallback message just because
+the model is uncertain. Return a JSON object:
+{{"reply":"natural reply or empty string","needs_human":false,"awaiting_reference":false,"should_reply":true}}.
+Set should_reply=false and reply="" when silence is better. Set awaiting_reference=true only if your reply actually
+asks for order/reference ID.
 '''
 
 
@@ -753,9 +829,7 @@ def ask_groq(key,user_text,language,history,knowledge,state,catalog,allowed_urls
         return data
     except (requests.RequestException,ValueError,KeyError,IndexError,TypeError):
         app.logger.warning('Groq generation unavailable')
-        return {'reply':tr(language,f'AI response dite problem hocche. Human support: {WHATSAPP_SUPPORT}',
-                          f'AI উত্তর দিতে সমস্যা হচ্ছে। Human support: {WHATSAPP_SUPPORT}',
-                          f'AI is temporarily unavailable. Human support: {WHATSAPP_SUPPORT}')}
+        return {'reply':'','needs_human':False,'awaiting_reference':False,'should_reply':False}
 
 
 URL_RE=re.compile(r'(?:https?://|www\.)[^\s<>"\']+',re.I)
@@ -790,8 +864,7 @@ def reply_for(key,text,sender,owner_chat_id=None,owner=False,instruction=''):
     # The summary table may not yet have been physically cleaned on this worker.
     if pending.get('updated_at','') < (datetime.now(timezone.utc)-timedelta(days=4)).isoformat():
         pending={}
-    continuing_id=bool(history and history[-1]['role']=='assistant' and
-                       any(x in history[-1]['text'] for x in ('manual verification','ম্যানুয়াল যাচাই')))
+    continuing_id=False
     awaiting_reference=bool(pending.get('awaiting_reference') or (history and history[-1]['role']=='assistant' and asks_reference(history[-1]['text'])))
     ref=reference_id(text,expected=awaiting_reference or continuing_id)
     issue=is_payment_problem(text)
@@ -837,6 +910,8 @@ def reply_for(key,text,sender,owner_chat_id=None,owner=False,instruction=''):
     elif wants_link(text): allowed=[p['url'] for p in found] or [WEBSITE]
     data=ask_groq(key,text,language,history,knowledge,state,found or catalog,allowed,
                   owner=owner,instruction=instruction,case=case)
+    if data.get('should_reply') is False:
+        return ''
     answer=enforce_links(strip_human_marker(data.get('reply','')),allowed)
     if fake_action(answer): answer=manual_reply(language,case.get('reference_id',''))
     if unsafe_request(answer) or sensitive(answer):
@@ -846,7 +921,7 @@ def reply_for(key,text,sender,owner_chat_id=None,owner=False,instruction=''):
         put_json('conversation_summary',key,{'awaiting_reference':True,'updated_at':now_iso()})
     if not owner and data.get('needs_human') is True and not asks_reference(answer):
         notify_owner(owner_chat_id,sender,text,reason=text[:180],context='\n'.join(x['text'] for x in history)+'\n'+text,key=key,ref_id=case.get('reference_id',''))
-    return answer or tr(language,'Ektu bistarito bolben?','একটু বিস্তারিত বলবেন?','Could you add a little detail?')
+    return answer
 
 
 # =========================================================
@@ -907,8 +982,10 @@ def converse(message,text,customer_id,connection_id=None,owner=False,instruction
     chat_id=message['chat']['id']; key=scope_key(customer_id,chat_id,connection_id)
     answer=reply_for(key,text,sender or message.get('from',{}),owner_chat_id,owner,instruction)
     # Commands themselves never become customer memory; only their question/answer.
-    deliver(chat_id,pretty_private_reply(text,answer),reply_to=reply_to or message.get('message_id'),business_connection_id=connection_id)
     if not sensitive(text): save_temp_message(key,'user',text)
+    if not answer:
+        return ''
+    deliver(chat_id,pretty_private_reply(text,answer),reply_to=reply_to or message.get('message_id'),business_connection_id=connection_id)
     save_temp_message(key,'assistant',answer)
     return answer
 
@@ -936,8 +1013,11 @@ def handle_group_message(message):
 
 
 def handle_customer(message,connection_id=None,owner_chat_id=None):
-    sender=message.get('from') or {}; text=(message.get('text') or '').strip()
-    if not text or sender.get('is_bot'): return
+    sender=message.get('from') or {}
+    if sender.get('is_bot'): return
+    key=scope_key(sender.get('id'),message.get('chat',{}).get('id'),connection_id)
+    text=incoming_text(message,key)
+    if not text: return
     save_customer(sender)
     cmd=command(text)
     if cmd=='/help':
@@ -969,7 +1049,9 @@ def handle_business_message(message):
         app.logger.warning('Business message ignored: business connection cannot reply')
         return
     app.logger.info('Business message accepted for customer routing')
-    text=(message.get('text') or '').strip()
+    key=scope_key(sender.get('id'),message.get('chat',{}).get('id'),connection)
+    text=incoming_text(message,key)
+    if not text: return
     if sender.get('id')==info['owner_id']:
         cmd=command(text)
         if not cmd:

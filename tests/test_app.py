@@ -273,6 +273,26 @@ class AdditionalTests(AppTests):
         self.assertEqual(args[0],'setWebhook')
         self.assertEqual(args[1]['secret_token'],app.webhook_secret())
         self.assertEqual(args[1]['allowed_updates'],['message','business_connection','business_message'])
+    def test_silent_model_reply_sends_nothing(self):
+        with patch.object(app,'ask_groq',return_value={'reply':'','should_reply':False,'needs_human':False}):
+            self.dispatch('ok')
+        self.assertFalse(self.sent)
+
+    def test_image_message_uses_understanding(self):
+        m=self.msg(''); m.pop('text',None); m['photo']=[{'file_id':'photo-1'}]
+        self.update_id+=1
+        with patch.object(app,'understand_image',return_value='Payment screenshot-e error dekhacche.'):
+            self.client.post('/webhook',json={'update_id':self.update_id,'business_message':m})
+        self.assertTrue(self.calls)
+        self.assertEqual(self.calls[-1][0][1],'Payment screenshot-e error dekhacche.')
+
+    def test_voice_message_uses_transcription(self):
+        m=self.msg(''); m.pop('text',None); m['voice']={'file_id':'voice-1'}
+        self.update_id+=1
+        with patch.object(app,'transcribe_voice',return_value='amar order pending'):
+            self.client.post('/webhook',json={'update_id':self.update_id,'business_message':m})
+        self.assertTrue(self.sent)
+
     def test_groq_wire_format_and_history(self):
         # Stop only the Groq stub, then intercept the HTTP transport.
         self.patches[-2].stop()
